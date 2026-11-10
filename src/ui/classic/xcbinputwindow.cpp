@@ -52,6 +52,7 @@ void XCBInputWindow::postCreateWindow() {
 
 void XCBInputWindow::updatePosition(InputContext *inputContext) {
     if (!visible()) {
+        resetPositionAdjustment();
         return;
     }
     int x, y, h;
@@ -66,6 +67,13 @@ void XCBInputWindow::updatePosition(InputContext *inputContext) {
     bottomSW = theme.inputPanel->shadowMargin->marginBottom.value();
 
     const auto anchor = compositionCursorRect(inputContext);
+    if (!positionAdjustmentActive_ || positionContext_.get() != inputContext ||
+        positionAnchor_ != anchor) {
+        horizontalOverflowShift_ = 0;
+        positionContext_ = inputContext->watch();
+        positionAnchor_ = anchor;
+        positionAdjustmentActive_ = true;
+    }
     x = anchor.left();
     y = anchor.top();
     h = anchor.height();
@@ -100,9 +108,12 @@ void XCBInputWindow::updatePosition(InputContext *inputContext) {
             newY = y + (h ? h : (10 * ((dpi_ < 0 ? 96.0 : dpi_) / 96.0)));
         }
 
-        if ((newX + static_cast<int>(actualWidth)) > closestScreen->right()) {
-            newX = closestScreen->right() - actualWidth;
-        }
+        const int overflow = std::max(
+            0, newX + actualWidth - closestScreen->right());
+        horizontalOverflowShift_ =
+            std::max(horizontalOverflowShift_, overflow);
+        newX = std::max(closestScreen->left(),
+                        newX - horizontalOverflowShift_);
 
         if ((newY + static_cast<int>(actualHeight)) > closestScreen->bottom()) {
             if (newY > closestScreen->bottom()) {
@@ -149,6 +160,7 @@ void XCBInputWindow::update(InputContext *inputContext) {
         if (oldVisible) {
             xcb_unmap_window(ui_->connection(), wid_);
         }
+        resetPositionAdjustment();
         return;
     }
 
@@ -183,6 +195,12 @@ void XCBInputWindow::update(InputContext *inputContext) {
     }
     cairo_surface_flush(surface_.get());
     xcb_flush(ui_->connection());
+}
+
+void XCBInputWindow::resetPositionAdjustment() {
+    horizontalOverflowShift_ = 0;
+    positionContext_.unwatch();
+    positionAdjustmentActive_ = false;
 }
 
 bool XCBInputWindow::filterEvent(xcb_generic_event_t *event) {

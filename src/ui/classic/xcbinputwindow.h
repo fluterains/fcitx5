@@ -29,6 +29,7 @@ public:
 
 private:
     void repaint();
+    void resetPositionAdjustment();
     cairo_surface_t *prepareFrame(int width, int height);
     void releaseFrames();
     std::pair<unsigned int, unsigned int>
@@ -53,6 +54,10 @@ private:
     unsigned int panelHeight_ = 0;
     unsigned int presentedWidth_ = 0;
     unsigned int presentedHeight_ = 0;
+    TrackableObjectReference<InputContext> positionContext_;
+    Rect positionAnchor_;
+    int horizontalOverflowShift_ = 0;
+    bool positionAdjustmentActive_ = false;
     bool shapeAvailable_ = false;
     xcb_atom_t atomBlur_;
     int dpi_ = -1;
