@@ -65,6 +65,7 @@ protected:
     // Override the font DPI in cairo/pango context. If less-equal than zero, it
     // will restore to font map default dpi.
     void setFontDPI(int dpi);
+    Rect compositionCursorRect(InputContext *inputContext);
     void resizeCandidates(size_t n);
     void appendText(std::string &s, PangoAttrList *attrList,
                     PangoAttrList *highlightAttrList, const Text &text);
@@ -89,6 +90,9 @@ protected:
     std::vector<MultilineLayout> candidateLayouts_;
     std::vector<Rect> candidateRegions_;
     TrackableObjectReference<InputContext> inputContext_;
+    TrackableObjectReference<InputContext> anchorContext_;
+    Rect compositionAnchor_;
+    bool anchorActive_ = false;
     bool visible_ = false;
     int cursor_ = 0;
     size_t nCandidates_ = 0;

@@ -271,7 +271,31 @@ void InputWindow::setTextToLayout(
     pango_attr_list_unref(newAttrList);
 }
 
+Rect InputWindow::compositionCursorRect(InputContext *ic) {
+    if (!ic) {
+        anchorActive_ = false;
+        anchorContext_.unwatch();
+        return Rect();
+    }
+    auto entry = parent_->instance()->inputMethodEntry(ic);
+    const auto &panel = ic->inputPanel();
+    const bool composing = !panel.preedit().empty() ||
+                           !panel.clientPreedit().empty();
+    if (!entry || entry->addon() != "rime" || !composing) {
+        anchorActive_ = false;
+        anchorContext_.unwatch();
+        return ic->cursorRect();
+    }
+    if (!anchorActive_ || anchorContext_.get() != ic) {
+        compositionAnchor_ = ic->cursorRect();
+        anchorContext_ = ic->watch();
+        anchorActive_ = true;
+    }
+    return compositionAnchor_;
+}
+
 std::pair<int, int> InputWindow::update(InputContext *inputContext) {
+    compositionCursorRect(inputContext);
     if ((parent_->suspended() &&
          parent_->instance()->currentUI() != "kimpanel") ||
         !inputContext) {

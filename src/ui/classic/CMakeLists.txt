@@ -23,7 +23,7 @@ if (ENABLE_X11)
     set(CLASSICUI_SRCS ${CLASSICUI_SRCS}
         xcbui.cpp xcbwindow.cpp xcbtraywindow.cpp xcbinputwindow.cpp xcbmenu.cpp)
     set(CLASSICUI_LIBS ${CLASSICUI_LIBS} PkgConfig::CairoXCB Fcitx5::Module::XCB
-        XCB::AUX XCB::ICCCM XCB::XINERAMA XCB::RANDR XCB::EWMH)
+        XCB::AUX XCB::ICCCM XCB::SHAPE XCB::XINERAMA XCB::RANDR XCB::EWMH)
 endif()
 
 if (ENABLE_DBUS)
