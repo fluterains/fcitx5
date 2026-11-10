@@ -19,15 +19,34 @@ popup 定位，也不覆盖 Kimpanel 或应用自绘候选框。
 
 ```sh
 docker buildx build -f Dockerfile.patch1 --output type=local,dest=out/patch1 .
-python3 tools/package-patch1.py BASE_UBUNTU_MODULES_DEB out/patch1/libclassicui.so out/fcitx5-modules_5.1.7-1build3+patched.1_amd64.deb
+apt download fcitx5-modules=5.1.7-1build3 fcitx5-modules-dev=5.1.7-1build3 \
+  fcitx5=5.1.7-1build3
+python3 tools/package-patch1.py \
+  fcitx5-modules_5.1.7-1build3_amd64.deb \
+  fcitx5-modules-dev_5.1.7-1build3_amd64.deb \
+  fcitx5_5.1.7-1build3_amd64.deb \
+  out/patch1/libclassicui.so \
+  out/patch1
+python3 tests/verify-patch1-packages.py out/patch1/libclassicui.so out/patch1
 ```
 
-BASE_UBUNTU_MODULES_DEB 为 Ubuntu 24.04 fcitx5-modules 5.1.7-1build3。
-包内部版本保留 5.1.7-1build3，以满足 fcitx5 的精确依赖；X-Local-Variant=patch1
-标识本地变体。文件名的 +patched.1 是下载标识。只替换 libclassicui.so。
-请勿将模块直接安装到其他 Fcitx ABI 的发行版。
+基础包为 Ubuntu 24.04 `fcitx5`、`fcitx5-modules` 和 `fcitx5-modules-dev`
+5.1.7-1build3。三个重打包文件内部版本均为 `5.1.7-1build3+patched.1`，并标记
+`X-Local-Variant=patch1`。核心元包及开发包对模块的精确依赖都同步指向补丁模块，
+只替换模块包中的 `libclassicui.so`。三个包版本都高于 Ubuntu 仓库包，因此正常
+升级不会用同版本原版模块覆盖补丁，也不会导致开发包被移除；不再需要 apt-mark
+hold。请勿安装到其他 Fcitx ABI 的发行版。
 
-安装：`sudo apt install --reinstall ./out/fcitx5-modules_5.1.7-1build3+patched.1_amd64.deb`。
+安装时必须将三个 deb 放在同一次 apt 事务中：
+
+```sh
+sudo apt install \
+  ./out/fcitx5-modules_5.1.7-1build3+patched.1_amd64.deb \
+  ./out/fcitx5-modules-dev_5.1.7-1build3+patched.1_amd64.deb \
+  ./out/fcitx5_5.1.7-1build3+patched.1_amd64.deb
+```
+
+若从旧 Patch1 升级，先执行 `sudo apt-mark unhold fcitx5-modules`。
 重启：`systemctl --user restart app-org.fcitx.Fcitx5@autostart.service`。
 
 ## 隔离测试
