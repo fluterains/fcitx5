@@ -6,9 +6,12 @@
  */
 
 #include "xcbinputwindow.h"
+#include <algorithm>
 #include <pango/pangocairo.h>
+#include <cairo-xcb.h>
 #include <xcb/xcb_aux.h>
 #include <xcb/xcb_icccm.h>
+#include <xcb/shape.h>
 #include "fcitx-utils/rect.h"
 
 namespace fcitx::classicui {
@@ -18,7 +21,22 @@ XCBInputWindow::XCBInputWindow(XCBUI *ui)
       atomBlur_(ui_->parent()->xcb()->call<IXCBModule::atom>(
           ui_->displayName(), "_KDE_NET_WM_BLUR_BEHIND_REGION", false)) {}
 
+XCBInputWindow::~XCBInputWindow() { releaseFrames(); }
+
 void XCBInputWindow::postCreateWindow() {
+    auto *shape =
+        xcb_get_extension_data(ui_->connection(), &xcb_shape_id);
+    shapeAvailable_ = false;
+    if (shape && shape->present) {
+        auto version = makeUniqueCPtr(xcb_shape_query_version_reply(
+            ui_->connection(), xcb_shape_query_version(ui_->connection()), nullptr));
+        shapeAvailable_ = version && (version->major_version > 1 ||
+            (version->major_version == 1 && version->minor_version >= 1));
+    }
+    auto *screen = xcb_aux_get_screen(ui_->connection(), ui_->defaultScreen());
+    stableCanvas_ = shapeAvailable_ &&
+        xcb_aux_get_depth_of_visual(screen, vid_) == 32;
+
     if (ui_->ewmh()->_NET_WM_WINDOW_TYPE_POPUP_MENU &&
         ui_->ewmh()->_NET_WM_WINDOW_TYPE) {
         xcb_ewmh_set_wm_window_type(
@@ -43,6 +61,7 @@ void XCBInputWindow::postCreateWindow() {
 
 void XCBInputWindow::updatePosition(InputContext *inputContext) {
     if (!visible()) {
+        resetPositionAdjustment();
         return;
     }
     int x, y, h;
@@ -56,14 +75,24 @@ void XCBInputWindow::updatePosition(InputContext *inputContext) {
     topSW = theme.inputPanel->shadowMargin->marginTop.value();
     bottomSW = theme.inputPanel->shadowMargin->marginBottom.value();
 
-    x = inputContext->cursorRect().left();
-    y = inputContext->cursorRect().top();
-    h = inputContext->cursorRect().height();
+    compositionCursorRect(inputContext);
+    followHostWindow(inputContext);
+    const auto anchor = compositionCursorRect(inputContext);
+    if (!positionAdjustmentActive_ || positionContext_.get() != inputContext ||
+        positionAnchor_ != anchor) {
+        horizontalOverflowShift_ = 0;
+        positionContext_ = inputContext->watch();
+        positionAnchor_ = anchor;
+        positionAdjustmentActive_ = true;
+    }
+    x = anchor.left();
+    y = anchor.top();
+    h = anchor.height();
 
-    actualWidth = width() - leftSW - rightSW;
-    actualWidth = actualWidth <= 0 ? width() : actualWidth;
-    actualHeight = height() - topSW - bottomSW;
-    actualHeight = actualHeight <= 0 ? height() : actualHeight;
+    actualWidth = panelWidth_ - leftSW - rightSW;
+    actualWidth = actualWidth <= 0 ? panelWidth_ : actualWidth;
+    actualHeight = panelHeight_ - topSW - bottomSW;
+    actualHeight = actualHeight <= 0 ? panelHeight_ : actualHeight;
 
     const Rect *closestScreen = nullptr;
     int shortestDistance = INT_MAX;
@@ -90,9 +119,12 @@ void XCBInputWindow::updatePosition(InputContext *inputContext) {
             newY = y + (h ? h : (10 * ((dpi_ < 0 ? 96.0 : dpi_) / 96.0)));
         }
 
-        if ((newX + static_cast<int>(actualWidth)) > closestScreen->right()) {
-            newX = closestScreen->right() - actualWidth;
-        }
+        const int overflow = std::max(
+            0, newX + actualWidth - closestScreen->right());
+        horizontalOverflowShift_ =
+            std::max(horizontalOverflowShift_, overflow);
+        newX = std::max(closestScreen->left(),
+                        newX - horizontalOverflowShift_);
 
         if ((newY + static_cast<int>(actualHeight)) > closestScreen->bottom()) {
             if (newY > closestScreen->bottom()) {
@@ -120,8 +152,8 @@ void XCBInputWindow::updatePosition(InputContext *inputContext) {
 }
 
 void XCBInputWindow::updateDPI(InputContext *inputContext) {
-    dpi_ = ui_->dpiByPosition(inputContext->cursorRect().left(),
-                              inputContext->cursorRect().top());
+    const auto anchor = compositionCursorRect(inputContext);
+    dpi_ = ui_->dpiByPosition(anchor.left(), anchor.top());
 
     setFontDPI(dpi_);
 }
@@ -139,54 +171,82 @@ void XCBInputWindow::update(InputContext *inputContext) {
         if (oldVisible) {
             xcb_unmap_window(ui_->connection(), wid_);
         }
+        resetPositionAdjustment();
         return;
     }
 
-    if (width != this->width() || height != this->height()) {
-        resize(width, height);
-        if (atomBlur_) {
-            Rect rect(0, 0, width, height);
-            shrink(rect, *ui_->parent()->theme().inputPanel->blurMargin);
-            if (!*ui_->parent()->theme().inputPanel->enableBlur ||
-                rect.isEmpty()) {
-                xcb_delete_property(ui_->connection(), wid_, atomBlur_);
-            } else {
-                std::vector<uint32_t> data;
-                if (ui_->parent()->theme().inputPanel->blurMask->empty()) {
-                    data.push_back(rect.left());
-                    data.push_back(rect.top());
-                    data.push_back(rect.width());
-                    data.push_back(rect.height());
-                    xcb_change_property(ui_->connection(),
-                                        XCB_PROP_MODE_REPLACE, wid_, atomBlur_,
-                                        XCB_ATOM_CARDINAL, 32, data.size(),
-                                        data.data());
-                } else {
-                    auto region = parent_->theme().mask(
-                        parent_->theme().maskConfig(), width, height);
-                    for (const auto &rect : region) {
-                        data.push_back(rect.left());
-                        data.push_back(rect.top());
-                        data.push_back(rect.width());
-                        data.push_back(rect.height());
-                    }
-                    xcb_change_property(ui_->connection(),
-                                        XCB_PROP_MODE_REPLACE, wid_, atomBlur_,
-                                        XCB_ATOM_CARDINAL, 32, data.size(),
-                                        data.data());
-                }
-            }
-        }
+    panelWidth_ = width;
+    panelHeight_ = height;
+    const auto [canvasWidth, canvasHeight] = canvasSize(width, height);
+
+    auto *frame = prepareFrame(canvasWidth, canvasHeight);
+    if (!frame) {
+        return;
+    }
+    auto *c = cairo_create(frame);
+    paint(c, panelWidth_, panelHeight_, /*scale=*/1.0);
+    cairo_destroy(c);
+    cairo_surface_flush(frame);
+    setFrameBackground();
+
+    // The monitor-wide canvas stays fixed while the painted panel keeps its
+    // exact layout size. Typing therefore never resizes the top-level window.
+    if (canvasWidth != static_cast<unsigned int>(this->width()) ||
+        canvasHeight != static_cast<unsigned int>(this->height()) ||
+        frameWindow_ != wid_) {
+        resize(canvasWidth, canvasHeight);
     }
 
-    cairo_t *c = cairo_create(prerender());
+    updateBlur(panelWidth_, panelHeight_);
     updatePosition(inputContext);
+    presentFrame();
+    setInputShape(panelWidth_, panelHeight_);
     if (!oldVisible) {
         xcb_map_window(ui_->connection(), wid_);
     }
-    paint(c, width, height, /*scale=*/1.0);
-    cairo_destroy(c);
-    render();
+    cairo_surface_flush(surface_.get());
+    xcb_flush(ui_->connection());
+}
+
+void XCBInputWindow::followHostWindow(InputContext *ic) {
+    if (!anchorActive_ || hostContext_.get() != ic) {
+        anchorWindow_ = XCB_NONE;
+        hostContext_.unwatch();
+    }
+    if (!anchorActive_) {
+        return;
+    }
+    const bool first = anchorWindow_ == XCB_NONE;
+    if (first) {
+        auto focus = makeUniqueCPtr(xcb_get_input_focus_reply(
+            ui_->connection(), xcb_get_input_focus(ui_->connection()), nullptr));
+        if (!focus || focus->focus <= XCB_INPUT_FOCUS_POINTER_ROOT) {
+            return;
+        }
+        anchorWindow_ = focus->focus;
+        hostContext_ = ic->watch();
+    }
+    auto origin = makeUniqueCPtr(xcb_translate_coordinates_reply(
+        ui_->connection(), xcb_translate_coordinates(ui_->connection(),
+            anchorWindow_, ui_->root(), 0, 0), nullptr));
+    if (!origin) {
+        anchorWindow_ = XCB_NONE;
+        return;
+    }
+    if (!first) {
+        compositionAnchor_ = compositionAnchor_.translated(
+            origin->dst_x - hostX_, origin->dst_y - hostY_);
+    }
+    hostX_ = origin->dst_x;
+    hostY_ = origin->dst_y;
+}
+
+void XCBInputWindow::resetPositionAdjustment() {
+    anchorWindow_ = XCB_NONE;
+    hostContext_.unwatch();
+    horizontalOverflowShift_ = 0;
+    positionContext_.unwatch();
+    positionAdjustmentActive_ = false;
 }
 
 bool XCBInputWindow::filterEvent(xcb_generic_event_t *event) {
@@ -196,7 +256,11 @@ bool XCBInputWindow::filterEvent(xcb_generic_event_t *event) {
     case XCB_EXPOSE: {
         auto *expose = reinterpret_cast<xcb_expose_event_t *>(event);
         if (expose->window == wid_) {
-            repaint();
+            if (expose->count == 0 && frontFrame_ >= 0) {
+                // Expose does not change content: restore the completed frame.
+                copyFrame(frontFrame_);
+                xcb_flush(ui_->connection());
+            }
             return true;
         }
         break;
@@ -239,15 +303,165 @@ bool XCBInputWindow::filterEvent(xcb_generic_event_t *event) {
     return false;
 }
 
+void XCBInputWindow::releaseFrames() {
+    contentSurface_.reset();
+    for (auto &frame : frames_) {
+        frame.surface.reset();
+        if (frame.pixmap != XCB_NONE) {
+            xcb_free_pixmap(ui_->connection(), frame.pixmap);
+        }
+        frame.pixmap = XCB_NONE;
+        frame.width = frame.height = 0;
+    }
+    if (copyGC_ != XCB_NONE) {
+        xcb_free_gc(ui_->connection(), copyGC_);
+        copyGC_ = XCB_NONE;
+    }
+    frontFrame_ = -1;
+    presentedWidth_ = presentedHeight_ = 0;
+    frameWindow_ = XCB_NONE;
+}
+
+std::pair<unsigned int, unsigned int>
+XCBInputWindow::canvasSize(unsigned int panelWidth,
+                           unsigned int panelHeight) const {
+    // Root-visual windows cannot display an alpha-cleared margin. Old Shape
+    // servers also cannot make the margin click-through.
+    if (!stableCanvas_) {
+        return {panelWidth, panelHeight};
+    }
+    unsigned int canvasWidth = panelWidth;
+    for (const auto &screen : ui_->screenRects()) {
+        canvasWidth = std::max(
+            canvasWidth, static_cast<unsigned int>(screen.first.width()));
+    }
+    const unsigned int canvasHeight =
+        std::max(static_cast<unsigned int>(height()), panelHeight);
+    return {canvasWidth, canvasHeight};
+}
+
+void XCBInputWindow::updateBlur(unsigned int width, unsigned int height) {
+    if (!atomBlur_) {
+        return;
+    }
+    Rect rect(0, 0, width, height);
+    shrink(rect, *ui_->parent()->theme().inputPanel->blurMargin);
+    if (!*ui_->parent()->theme().inputPanel->enableBlur || rect.isEmpty()) {
+        xcb_delete_property(ui_->connection(), wid_, atomBlur_);
+        return;
+    }
+
+    std::vector<uint32_t> data;
+    if (ui_->parent()->theme().inputPanel->blurMask->empty()) {
+        data.push_back(rect.left());
+        data.push_back(rect.top());
+        data.push_back(rect.width());
+        data.push_back(rect.height());
+    } else {
+        auto region = parent_->theme().mask(
+            parent_->theme().maskConfig(), width, height);
+        for (const auto &maskRect : region) {
+            data.push_back(maskRect.left());
+            data.push_back(maskRect.top());
+            data.push_back(maskRect.width());
+            data.push_back(maskRect.height());
+        }
+    }
+    xcb_change_property(ui_->connection(), XCB_PROP_MODE_REPLACE, wid_,
+                        atomBlur_, XCB_ATOM_CARDINAL, 32, data.size(),
+                        data.data());
+}
+
+void XCBInputWindow::setInputShape(unsigned int width, unsigned int height) {
+    if (!shapeAvailable_) {
+        return;
+    }
+    xcb_rectangle_t rectangle;
+    rectangle.x = 0;
+    rectangle.y = 0;
+    rectangle.width = width;
+    rectangle.height = height;
+    xcb_shape_rectangles(ui_->connection(), XCB_SHAPE_SO_SET,
+                         XCB_SHAPE_SK_INPUT, XCB_CLIP_ORDERING_UNSORTED, wid_,
+                         0, 0, 1, &rectangle);
+}
+
+cairo_surface_t *XCBInputWindow::prepareFrame(int width, int height) {
+    auto *conn = ui_->connection();
+    if (frameWindow_ != wid_) {
+        releaseFrames();
+        frameWindow_ = wid_;
+        copyGC_ = xcb_generate_id(conn);
+        const uint32_t graphicsExposures = 0;
+        xcb_create_gc(conn, copyGC_, wid_, XCB_GC_GRAPHICS_EXPOSURES,
+                      &graphicsExposures);
+    }
+    preparedFrame_ = frontFrame_ == 0 ? 1 : 0;
+    auto &frame = frames_[preparedFrame_];
+    if (!frame.surface || frame.width < width || frame.height < height) {
+        frame.surface.reset();
+        if (frame.pixmap != XCB_NONE) {
+            xcb_free_pixmap(conn, frame.pixmap);
+        }
+        // The frame canvas is intentionally larger than the visible panel so
+        // content can grow without resizing and exposing the top-level window.
+        frame.width = std::max(frame.width, width);
+        frame.height = std::max(frame.height, height);
+        auto *screen = xcb_aux_get_screen(conn, ui_->defaultScreen());
+        auto visual = vid_ ? vid_ : screen->root_visual;
+        frame.pixmap = xcb_generate_id(conn);
+        xcb_create_pixmap(conn, xcb_aux_get_depth_of_visual(screen, visual),
+                          frame.pixmap, wid_, frame.width, frame.height);
+        frame.surface.reset(cairo_xcb_surface_create(
+            conn, frame.pixmap, xcb_aux_find_visual_by_id(screen, visual),
+            frame.width, frame.height));
+    }
+    if (cairo_surface_status(frame.surface.get()) != CAIRO_STATUS_SUCCESS) {
+        return nullptr;
+    }
+    contentSurface_.reset(cairo_surface_reference(frame.surface.get()));
+    auto *cr = cairo_create(frame.surface.get());
+    cairo_set_operator(cr, CAIRO_OPERATOR_CLEAR);
+    cairo_paint(cr);
+    cairo_destroy(cr);
+    return frame.surface.get();
+}
+
+void XCBInputWindow::setFrameBackground() {
+    const uint32_t pixmap = frames_[preparedFrame_].pixmap;
+    xcb_change_window_attributes(ui_->connection(), wid_, XCB_CW_BACK_PIXMAP,
+                                  &pixmap);
+}
+
+void XCBInputWindow::copyFrame(int index) {
+    const unsigned int copyWidth = std::max(presentedWidth_, panelWidth_);
+    const unsigned int copyHeight = std::max(presentedHeight_, panelHeight_);
+    xcb_copy_area(ui_->connection(), frames_[index].pixmap, wid_, copyGC_, 0,
+                   0, 0, 0, copyWidth, copyHeight);
+    cairo_surface_mark_dirty(surface_.get());
+}
+
+void XCBInputWindow::presentFrame() {
+    frontFrame_ = preparedFrame_;
+    // One server-side copy replaces the complete window image.
+    copyFrame(frontFrame_);
+    presentedWidth_ = panelWidth_;
+    presentedHeight_ = panelHeight_;
+}
+
 void XCBInputWindow::repaint() {
     if (!visible()) {
         return;
     }
-    if (auto *surface = prerender()) {
+    if (auto *surface = prepareFrame(width(), height())) {
         cairo_t *c = cairo_create(surface);
-        paint(c, width(), height(), /*scale=*/1.0);
+        paint(c, panelWidth_, panelHeight_, /*scale=*/1.0);
         cairo_destroy(c);
-        render();
+        cairo_surface_flush(surface);
+        setFrameBackground();
+        presentFrame();
+        setInputShape(panelWidth_, panelHeight_);
+        xcb_flush(ui_->connection());
     }
 }
 
