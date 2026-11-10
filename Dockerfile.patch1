@@ -1,0 +1,24 @@
+# syntax=docker/dockerfile:1
+FROM ubuntu:24.04 AS builder
+ARG DEBIAN_FRONTEND=noninteractive
+ARG BUILD_JOBS=8
+ARG APT_MIRROR=http://mirror.nju.edu.cn/ubuntu
+RUN sed -i "s|http://archive.ubuntu.com/ubuntu|${APT_MIRROR}|g; s|http://security.ubuntu.com/ubuntu|${APT_MIRROR}|g" \
+      /etc/apt/sources.list.d/ubuntu.sources \
+    && apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake ninja-build extra-cmake-modules gettext curl ca-certificates \
+    libsystemd-dev libfmt-dev uuid-dev libexpat1-dev libjson-c-dev \
+    libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev libxcb-util-dev \
+    libxcb-xkb-dev libxcb-shape0-dev libxcb-xfixes0-dev libxcb-icccm4-dev \
+    libxcb-xinerama0-dev \
+    libxcb-randr0-dev libxcb-ewmh-dev libxcb-keysyms1-dev libxcb-imdkit-dev \
+    libxkbfile-dev libcairo2-dev libpango1.0-dev libgdk-pixbuf-2.0-dev \
+    libglib2.0-dev libwayland-dev wayland-protocols iso-codes xkb-data \
+    libevent-dev pkg-config zlib1g-dev && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY . .
+RUN cmake -S . -B /build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+       -DCMAKE_INSTALL_PREFIX=/usr -DENABLE_TEST=OFF -DENABLE_ENCHANT=OFF \
+    && cmake --build /build --target classicui --parallel "${BUILD_JOBS}"
+FROM scratch
+COPY --from=builder /build/src/ui/classic/libclassicui.so /
