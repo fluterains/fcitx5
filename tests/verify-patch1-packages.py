@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate the paired Fcitx5 Patch1 packages and their patched payload."""
+"""Validate the matching Fcitx5 patch packages and their patched payload."""
 import argparse
 import hashlib
 from pathlib import Path
@@ -8,12 +8,12 @@ import tempfile
 
 
 BASE_VERSION = '5.1.7-1build3'
-PATCHED_VERSION = f'{BASE_VERSION}+patched.1'
-
 parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--patch-version', type=int, choices=range(1, 100), default=1)
 parser.add_argument('payload', type=Path)
 parser.add_argument('package_dir', type=Path)
 args = parser.parse_args()
+PATCHED_VERSION = f'{BASE_VERSION}+patched.{args.patch_version}'
 
 
 def field(package: Path, name: str) -> str:
@@ -40,7 +40,7 @@ for package in (modules, modules_dev, meta):
         raise SystemExit(f'wrong version: {package}')
     if field(package, 'Architecture') != 'amd64':
         raise SystemExit(f'wrong architecture: {package}')
-    if field(package, 'X-Local-Variant') != 'patch1':
+    if field(package, 'X-Local-Variant') != f'patch{args.patch_version}':
         raise SystemExit(f'wrong local variant: {package}')
 
 if field(modules, 'Package') != 'fcitx5-modules':

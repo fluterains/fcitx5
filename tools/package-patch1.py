@@ -10,15 +10,16 @@ import tempfile
 
 
 BASE_VERSION = '5.1.7-1build3'
-PATCHED_VERSION = f'{BASE_VERSION}+patched.1'
-
 parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--patch-version', type=int, choices=range(1, 100), default=1)
 parser.add_argument('base_modules', type=Path)
 parser.add_argument('base_modules_dev', type=Path)
 parser.add_argument('base_meta', type=Path)
 parser.add_argument('payload', type=Path)
 parser.add_argument('output_dir', type=Path)
 args = parser.parse_args()
+PATCHED_VERSION = f'{BASE_VERSION}+patched.{args.patch_version}'
+VARIANT = f'patch{args.patch_version}'
 
 
 def extract_package(base: Path, root: Path, package: str) -> str:
@@ -37,7 +38,7 @@ def extract_package(base: Path, root: Path, package: str) -> str:
 def finish_package(root: Path, text: str, output: Path) -> None:
     text = re.sub(rf'^Version: .+$', f'Version: {PATCHED_VERSION}', text, flags=re.M)
     text = re.sub(r'^X-Local-Variant:.*\n?', '', text, flags=re.M)
-    text += 'X-Local-Variant: patch1\n'
+    text += f'X-Local-Variant: {VARIANT}\n'
     files = sorted(
         path
         for path in root.rglob('*')
