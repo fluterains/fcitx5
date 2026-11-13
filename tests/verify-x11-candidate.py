@@ -22,7 +22,22 @@ os.environ.update(HOME=str(task_dir/'home'), XDG_CONFIG_HOME=str(task_dir/'confi
 conf = task_dir/'config/fcitx5'
 (conf/'conf').mkdir(parents=True)
 (conf/'profile').write_text('[Groups/0]\nName=Review\nDefault Layout=us\nDefaultIM=rime\n\n[Groups/0/Items/0]\nName=rime\n\n[GroupOrder]\n0=Review\n')
-(conf/'conf/classicui.conf').write_text('Vertical Candidate List=False\nTheme=default\nFont="Sans 12"\n')
+(conf/'conf/classicui.conf').write_text('Vertical Candidate List=False\nTheme=placement-test\nFont="Sans 12"\nPerScreenDPI=False\n')
+theme = task_dir/'data/fcitx5/themes/placement-test'
+theme.mkdir(parents=True)
+# Nonzero shadows catch placements which only clear the panel body.
+(theme/'theme.conf').write_text('''[InputPanel/Background]
+Color=#ffffffff
+[InputPanel/ContentMargin]
+Left=6
+Right=6
+Top=6
+Bottom=6
+[InputPanel/ShadowMargin]
+Top=6
+Bottom=6
+''')
+test_dpi = int(os.environ.get('TEST_DPI', '96'))
 (conf/'conf/rime.conf').write_text('PreeditMode=Raw input\nPreeditCursorPositionAtBeginning=False\n')
 rime = task_dir/'data/fcitx5/rime'
 rime.mkdir(parents=True)
@@ -69,6 +84,15 @@ libx.XGetImage.restype = ctypes.c_void_p
 libx.XGetPixel.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
 libx.XGetPixel.restype = ctypes.c_ulong
 libx.XDestroyImage.argtypes = [ctypes.c_void_p]
+libx.XFree.argtypes = [ctypes.c_void_p]
+class XRectangle(ctypes.Structure):
+    _fields_ = [('x', ctypes.c_short), ('y', ctypes.c_short),
+                ('width', ctypes.c_ushort), ('height', ctypes.c_ushort)]
+libshape = ctypes.CDLL('libXext.so.6')
+libshape.XShapeGetRectangles.argtypes = [ctypes.c_void_p, ctypes.c_ulong,
+                                      ctypes.c_int, ctypes.POINTER(ctypes.c_int),
+                                      ctypes.POINTER(ctypes.c_int)]
+libshape.XShapeGetRectangles.restype = ctypes.POINTER(XRectangle)
 display = libx.XOpenDisplay(None)
 root = libx.XDefaultRootWindow(display)
 host = libx.XCreateSimpleWindow(display, root, 50, 50, 600, 400, 0, 0, 0xffffff)
@@ -80,6 +104,7 @@ libx.XSync(display, 0)
 libx.XSetWindowBackground(display, root, 0x735997)
 libx.XClearWindow(display, root)
 libx.XSync(display, 0)
+subprocess.run(['xrdb', '-merge'], input=f'Xft.dpi:\t{test_dpi}\n', text=True, check=True)
 
 def image_pixel(window, x, y):
     img = libx.XGetImage(display, window, x, y, 1, 1, ctypes.c_ulong(-1), 2)
@@ -100,6 +125,12 @@ def panel(stage):
     for k in ('Absolute upper-left X', 'Absolute upper-left Y', 'Width', 'Height', 'Depth', 'Map State'):
         fields[k] = re.search(r'\b' + re.escape(k) + r':\s+([^\n]+)', info).group(1)
     if fields['Map State'] == 'IsViewable':
+        count, ordering = ctypes.c_int(), ctypes.c_int()
+        rectangles = libshape.XShapeGetRectangles(display, int(wid, 16), 2,
+                                                 ctypes.byref(count), ctypes.byref(ordering))
+        assert count.value == 1
+        fields['panel_height'] = rectangles[0].height
+        libx.XFree(rectangles)
         fields['right_blank_pixel'] = image_pixel(int(wid, 16), max(0, int(fields['Width'])-150), 10)
         fields['root_background_pixel'] = image_pixel(root, 10, 10)
     print(stage, fields, flush=True)
@@ -153,6 +184,40 @@ try:
     assert int(wide['Absolute upper-left X']) < int(narrow['Absolute upper-left X'])
     assert shrunk['Absolute upper-left X'] == wide['Absolute upper-left X']
     print('PASS: frozen caret anchor and sticky overflow', flush=True)
+
+    def begin_at(y, height=20):
+        ic.ProcessKeyEvent(0xff1b, 0, 0, False, 0)
+        ic.SetCursorRect(100, y, 1, height)
+        ic.ProcessKeyEvent(ord('a'), 0, 0, False, 0)
+        return panel(f'PLACEMENT_{y}_{height}')
+
+    gap = max(1, round(8 * test_dpi / 96))
+    below = begin_at(100)
+    assert int(below['Absolute upper-left Y']) == 120 + gap, below
+    last_below_y = 900 - below['panel_height'] - gap - 20
+    exact_fit = begin_at(last_below_y)
+    assert int(exact_fit['Absolute upper-left Y']) + exact_fit['panel_height'] == 900, exact_fit
+    no_longer_fits = begin_at(last_below_y + 1)
+    assert int(no_longer_fits['Absolute upper-left Y']) + no_longer_fits['panel_height'] == last_below_y + 1 - gap, no_longer_fits
+    bottom = begin_at(875)
+    assert int(bottom['Absolute upper-left Y']) + bottom['panel_height'] == 875 - gap, bottom
+    assert int(bottom['Absolute upper-left Y']) >= 0, bottom
+    zero_height = begin_at(890, 0)
+    assert int(zero_height['Absolute upper-left Y']) + zero_height['panel_height'] == 890 - gap, zero_height
+    # A new preview line must not grow underneath the still-anchored panel.
+    begin_at(800)
+    ic.SetCursorRect(140, 840, 1, 20)
+    ic.ProcessKeyEvent(ord('b'), 0, 0, False, 0)
+    wrapped = panel('WRAPPED_PREVIEW')
+    top = int(wrapped['Absolute upper-left Y'])
+    bottom_edge = top + wrapped['panel_height']
+    assert top >= 860 + gap or bottom_edge <= 800 - gap, wrapped
+    # Late cursor-height updates must also be respected during composition.
+    begin_at(100, 0)
+    ic.SetCursorRect(120, 100, 1, 40)
+    tall_cursor = panel('CURSOR_HEIGHT_UPDATED')
+    assert int(tall_cursor['Absolute upper-left Y']) == 140 + gap, tall_cursor
+    print(f'PASS: vertical avoidance, shadows, wrapped preview and gap at {test_dpi} DPI', flush=True)
     ic.ProcessKeyEvent(0xff1b, 0, 0, False, 0)
     ic.SetCursorRect(100, 100, 1, 20)
     print('QUICKPHRASE_TRIGGER', bool(ic.ProcessKeyEvent(0x60, 0, 64, False, 0)), flush=True)

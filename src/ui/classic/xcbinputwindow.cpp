@@ -7,6 +7,7 @@
 
 #include "xcbinputwindow.h"
 #include <algorithm>
+#include <cmath>
 #include <pango/pangocairo.h>
 #include <cairo-xcb.h>
 #include <xcb/xcb_aux.h>
@@ -64,16 +65,14 @@ void XCBInputWindow::updatePosition(InputContext *inputContext) {
         resetPositionAdjustment();
         return;
     }
-    int x, y, h;
+    int x, y;
 
     // add support of input panel offset here.
     // TODO: RTL support.
     auto &theme = parent_->theme();
-    int leftSW, rightSW, topSW, bottomSW, actualWidth, actualHeight;
+    int leftSW, rightSW, actualWidth;
     leftSW = theme.inputPanel->shadowMargin->marginLeft.value();
     rightSW = theme.inputPanel->shadowMargin->marginRight.value();
-    topSW = theme.inputPanel->shadowMargin->marginTop.value();
-    bottomSW = theme.inputPanel->shadowMargin->marginBottom.value();
 
     compositionCursorRect(inputContext);
     followHostWindow(inputContext);
@@ -86,18 +85,30 @@ void XCBInputWindow::updatePosition(InputContext *inputContext) {
         positionAdjustmentActive_ = true;
     }
     x = anchor.left();
-    y = anchor.top();
-    h = anchor.height();
+
+    const double scale = (dpi_ > 0 ? dpi_ : 96) / 96.0;
+    const int gap = std::max(1, static_cast<int>(std::lround(8 * scale)));
+    const int fallbackHeight =
+        std::max(1, static_cast<int>(std::lround(10 * scale)));
+    const auto cursor = inputContext->cursorRect();
+    // Keep the horizontal composition anchor, but clear the whole preview's
+    // vertical extent when it wraps or the client supplies its height late.
+    const int previewTop = std::min(anchor.top(), cursor.top());
+    const int previewBottom = std::max(
+        anchor.top() + (anchor.height() > 0 ? anchor.height() : fallbackHeight),
+        cursor.top() + (cursor.height() > 0 ? cursor.height() : fallbackHeight));
+    // Work with the full painted panel, including its shadows. The retained
+    // transparent canvas can be taller and must not influence placement.
+    const int panelHeight = static_cast<int>(panelHeight_);
+    y = previewBottom + gap;
 
     actualWidth = panelWidth_ - leftSW - rightSW;
     actualWidth = actualWidth <= 0 ? panelWidth_ : actualWidth;
-    actualHeight = panelHeight_ - topSW - bottomSW;
-    actualHeight = actualHeight <= 0 ? panelHeight_ : actualHeight;
 
     const Rect *closestScreen = nullptr;
     int shortestDistance = INT_MAX;
     for (const auto &rect : ui_->screenRects()) {
-        int thisDistance = rect.first.distance(x, y);
+        int thisDistance = rect.first.distance(anchor.left(), anchor.top());
         if (thisDistance < shortestDistance) {
             shortestDistance = thisDistance;
             closestScreen = &rect.first;
@@ -113,10 +124,22 @@ void XCBInputWindow::updatePosition(InputContext *inputContext) {
             newX = x;
         }
 
-        if (y < closestScreen->top()) {
-            newY = closestScreen->top();
+        const int below = previewBottom + gap;
+        const int above = previewTop - gap - panelHeight;
+        const int screenTop = closestScreen->top();
+        const int screenBottom = closestScreen->bottom();
+        if (below >= screenTop && below + panelHeight <= screenBottom) {
+            newY = below;
+        } else if (above >= screenTop && above + panelHeight <= screenBottom) {
+            newY = above;
         } else {
-            newY = y + (h ? h : (10 * ((dpi_ < 0 ? 96.0 : dpi_) / 96.0)));
+            // If neither side can hold the panel, use the roomier side and
+            // keep as much of it on this monitor as possible.
+            const int roomBelow = screenBottom - below;
+            const int roomAbove = previewTop - gap - screenTop;
+            newY = std::clamp(roomBelow >= roomAbove ? below : above,
+                              screenTop,
+                              std::max(screenTop, screenBottom - panelHeight));
         }
 
         const int overflow = std::max(
@@ -126,20 +149,12 @@ void XCBInputWindow::updatePosition(InputContext *inputContext) {
         newX = std::max(closestScreen->left(),
                         newX - horizontalOverflowShift_);
 
-        if ((newY + static_cast<int>(actualHeight)) > closestScreen->bottom()) {
-            if (newY > closestScreen->bottom()) {
-                newY = closestScreen->bottom() - actualHeight - 40;
-            } else { /* better position the window */
-                newY = newY - actualHeight - ((h == 0) ? 40 : h);
-            }
-        }
         x = newX;
         y = newY;
     }
 
     // exclude shadow border width
     x -= leftSW;
-    y -= topSW;
 
     xcb_params_configure_window_t wc;
     wc.x = x;
