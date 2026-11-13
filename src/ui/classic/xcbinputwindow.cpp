@@ -90,10 +90,23 @@ void XCBInputWindow::updatePosition(InputContext *inputContext) {
     const int gap = std::max(1, static_cast<int>(std::lround(8 * scale)));
     const int fallbackHeight =
         std::max(1, static_cast<int>(std::lround(10 * scale)));
+    auto *metrics = pango_context_get_metrics(
+        context_.get(), pango_context_get_font_description(context_.get()),
+        pango_context_get_language(context_.get()));
+    const int estimatedLineHeight = std::max(
+        static_cast<int>(std::lround(40 * scale)),
+        PANGO_PIXELS_CEIL(pango_font_metrics_get_ascent(metrics) +
+                          pango_font_metrics_get_descent(metrics)));
+    pango_font_metrics_unref(metrics);
     const auto cursor = inputContext->cursorRect();
+    const auto lineTop = [estimatedLineHeight](const Rect &rect) {
+        // A zero-height position can be an XIM baseline (or a line-bottom
+        // point), not the top of the preedit. Clear the text above it too.
+        return rect.top() - (rect.height() > 0 ? 0 : estimatedLineHeight);
+    };
     // Keep the horizontal composition anchor, but clear the whole preview's
     // vertical extent when it wraps or the client supplies its height late.
-    const int previewTop = std::min(anchor.top(), cursor.top());
+    const int previewTop = std::min(lineTop(anchor), lineTop(cursor));
     const int previewBottom = std::max(
         anchor.top() + (anchor.height() > 0 ? anchor.height() : fallbackHeight),
         cursor.top() + (cursor.height() > 0 ? cursor.height() : fallbackHeight));
@@ -155,6 +168,14 @@ void XCBInputWindow::updatePosition(InputContext *inputContext) {
 
     // exclude shadow border width
     x -= leftSW;
+
+    CLASSICUI_DEBUG() << "Candidate placement: frontend="
+                      << inputContext->frontendName() << " anchor=" << anchor
+                      << " cursor=" << cursor << " previewTop=" << previewTop
+                      << " previewBottom=" << previewBottom
+                      << " panelHeight=" << panelHeight << " gap=" << gap
+                      << " screen=" << (closestScreen ? *closestScreen : Rect())
+                      << " position=" << x << "," << y;
 
     xcb_params_configure_window_t wc;
     wc.x = x;

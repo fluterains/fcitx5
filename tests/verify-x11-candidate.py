@@ -1,7 +1,9 @@
 import ctypes
+import json
 import os
 from pathlib import Path
 import re
+import select
 import subprocess
 import tempfile
 import time
@@ -39,6 +41,7 @@ Bottom=6
 ''')
 test_dpi = int(os.environ.get('TEST_DPI', '96'))
 (conf/'conf/rime.conf').write_text('PreeditMode=Raw input\nPreeditCursorPositionAtBeginning=False\n')
+(conf/'conf/xim.conf').write_text('UseOnTheSpot=True\n')
 rime = task_dir/'data/fcitx5/rime'
 rime.mkdir(parents=True)
 (rime/'default.yaml').write_text('config_version: "1"\nschema_list:\n  - schema: review\n')
@@ -60,9 +63,10 @@ menu:
 ''')
 log = (task_dir/'fcitx5.log').open('w')
 fcitx = None
+gtk_fixture = None
 # Start after the synthetic host/compositor exists.
 def start_fcitx():
-    return subprocess.Popen(['fcitx5', '-D', '--disable=all', '--enable=xcb,dbus,dbusfrontend,classicui,keyboard,quickphrase,rime', '--ui=classicui'], stdout=log, stderr=log)
+    return subprocess.Popen(['fcitx5', '-D', '--disable=all', '--enable=xcb,xim,dbus,dbusfrontend,classicui,keyboard,quickphrase,rime', '--ui=classicui', '--verbose=classicui=5'], stdout=log, stderr=log)
 
 libx = ctypes.CDLL('libX11.so.6')
 libx.XOpenDisplay.restype = ctypes.c_void_p
@@ -203,7 +207,11 @@ try:
     assert int(bottom['Absolute upper-left Y']) + bottom['panel_height'] == 875 - gap, bottom
     assert int(bottom['Absolute upper-left Y']) >= 0, bottom
     zero_height = begin_at(890, 0)
-    assert int(zero_height['Absolute upper-left Y']) + zero_height['panel_height'] == 890 - gap, zero_height
+    # XIM can report a baseline point with no height, rather than a line-top
+    # rectangle. Model a 20-logical-pixel line above that point, independently
+    # of the candidate-placement implementation's fallback calculation.
+    baseline_line_top = 890 - round(20 * test_dpi / 96)
+    assert int(zero_height['Absolute upper-left Y']) + zero_height['panel_height'] <= baseline_line_top - gap, zero_height
     # A new preview line must not grow underneath the still-anchored panel.
     begin_at(800)
     ic.SetCursorRect(140, 840, 1, 20)
@@ -222,7 +230,32 @@ try:
     ic.SetCursorRect(100, 100, 1, 20)
     print('QUICKPHRASE_TRIGGER', bool(ic.ProcessKeyEvent(0x60, 0, 64, False, 0)), flush=True)
     panel('QUICKPHRASE_NO_COMPOSITOR')
+
+    # Exercise a real GTK -> XIM client too: its spot is a baseline with zero
+    # height. Compare against the widget's actual Pango preedit line, instead
+    # of assuming that a synthetic cursor point describes a line top.
+    ic.ProcessKeyEvent(0xff1b, 0, 0, False, 0)
+    ic.FocusOut()
+    environment = dict(os.environ, GTK_IM_MODULE='xim', XMODIFIERS='@im=fcitx',
+                       GDK_BACKEND='x11')
+    gtk_fixture = subprocess.Popen(
+        [sys.executable, str(Path(__file__).with_name('gtk-xim-fixture.py'))],
+        env=environment, stdout=subprocess.PIPE, stderr=log, text=True)
+    assert select.select([gtk_fixture.stdout], [], [], 10)[0], 'GTK XIM fixture timed out'
+    line = json.loads(gtk_fixture.stdout.readline())
+    assert 'error' not in line, line
+    gtk_panel = panel('REAL_GTK_XIM_BASELINE')
+    line_top, line_height = line['top'], line['height']
+    panel_top = int(gtk_panel['Absolute upper-left Y'])
+    panel_bottom = panel_top + gtk_panel['panel_height']
+    print('REAL_GTK_PREEDIT_LINE', line_top, line_top + line_height, flush=True)
+    assert panel_bottom <= line_top - gap or panel_top >= line_top + line_height + gap, gtk_panel
+    assert 'frontend=xim' in (task_dir/'fcitx5.log').read_text()
+    print(f'PASS: actual GTK XIM preedit avoidance at {test_dpi} DPI', flush=True)
 finally:
+    if gtk_fixture is not None:
+        gtk_fixture.terminate()
+        gtk_fixture.wait(timeout=5)
     fcitx.terminate()
     try:
         fcitx.wait(timeout=5)
